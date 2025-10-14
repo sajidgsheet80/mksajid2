@@ -23,6 +23,10 @@ app.secret_key = "sajid_secret_key_2024"
 user_sessions = {}
 active_user_sessions = {}  # Track one session per user
 
+# ---- Fixed Thresholds ----
+FIXED_CE_THRESHOLD = 20
+FIXED_PE_THRESHOLD = 20
+
 # ---- User-specific Globals (stored per user) ----
 def init_user_data(username):
     """Initialize user-specific data"""
@@ -33,8 +37,6 @@ def init_user_data(username):
             'app_session': None,
             'atm_strike': None,
             'initial_data': None,
-            'atm_ce_plus20': 20,
-            'atm_pe_plus20': 20,
             'symbol_prefix': "NSE:NIFTY25",
             'ce_strike_offset': -300,
             'pe_strike_offset': 300,
@@ -370,8 +372,6 @@ def background_bot_worker(username):
             # Get user-specific settings
             atm_strike = get_user_data(username, 'atm_strike')
             initial_data = get_user_data(username, 'initial_data')
-            atm_ce_plus20 = get_user_data(username, 'atm_ce_plus20')
-            atm_pe_plus20 = get_user_data(username, 'atm_pe_plus20')
             symbol_prefix = get_user_data(username, 'symbol_prefix')
             ce_strike_offset = get_user_data(username, 'ce_strike_offset')
             pe_strike_offset = get_user_data(username, 'pe_strike_offset')
@@ -439,10 +439,10 @@ def background_bot_worker(username):
                 ce_ltp = getattr(row, "CE_LTP", None)
                 pe_ltp = getattr(row, "PE_LTP", None)
 
-                # CE order at offset strike
+                # CE order at offset strike (using fixed threshold)
                 if strike == ce_target_strike and ce_ltp is not None:
                     initial_ce = next((item["CE_LTP"] for item in initial_data if item["strike_price"] == strike), None)
-                    if initial_ce is not None and ce_ltp > initial_ce + atm_ce_plus20:
+                    if initial_ce is not None and ce_ltp > initial_ce + FIXED_CE_THRESHOLD:
                         signal_name = f"CE_OFFSET_{strike}"
                         if signal_name not in placed_orders:
                             signals.append(f"{strike} {ce_ltp} CE Offset Strike")
@@ -452,10 +452,10 @@ def background_bot_worker(username):
                             set_user_data(username, 'signals', signals)
                             set_user_data(username, 'placed_orders', placed_orders)
 
-                # PE order at offset strike
+                # PE order at offset strike (using fixed threshold)
                 if strike == pe_target_strike and pe_ltp is not None:
                     initial_pe = next((item["PE_LTP"] for item in initial_data if item["strike_price"] == strike), None)
-                    if initial_pe is not None and pe_ltp > initial_pe + atm_pe_plus20:
+                    if initial_pe is not None and pe_ltp > initial_pe + FIXED_PE_THRESHOLD:
                         signal_name = f"PE_OFFSET_{strike}"
                         if signal_name not in placed_orders:
                             signals.append(f"{strike} {pe_ltp} PE Offset Strike")
@@ -716,7 +716,8 @@ SIGNUP_TEMPLATE = """
         {% endif %}
         <div class="info">
             🔑 You need your own Fyers API credentials. Get them from: <a href="https://fyers.in/dev" target="_blank">https://fyers.in/dev</a><br>
-            🔒 One session per user. New login will terminate previous session.
+            🔒 One session per user. New login will terminate previous session.<br>
+            📊 CE/PE thresholds are fixed at 20 points.
         </div>
         <form method="POST">
             <div class="form-group">
@@ -853,8 +854,6 @@ def dashboard():
     return render_template_string(
         TEMPLATE,
         username=username,
-        atm_ce_plus20=get_user_data(username, 'atm_ce_plus20'),
-        atm_pe_plus20=get_user_data(username, 'atm_pe_plus20'),
         symbol_prefix=get_user_data(username, 'symbol_prefix'),
         ce_strike_offset=get_user_data(username, 'ce_strike_offset'),
         pe_strike_offset=get_user_data(username, 'pe_strike_offset'),
@@ -905,14 +904,6 @@ def index():
     
     if request.method == "POST":
         try:
-            set_user_data(username, 'atm_ce_plus20', float(request.form.get("atm_ce_plus20", get_user_data(username, 'atm_ce_plus20'))))
-        except (ValueError, TypeError):
-            pass
-        try:
-            set_user_data(username, 'atm_pe_plus20', float(request.form.get("atm_pe_plus20", get_user_data(username, 'atm_pe_plus20'))))
-        except (ValueError, TypeError):
-            pass
-        try:
             set_user_data(username, 'ce_strike_offset', int(request.form.get("ce_strike_offset", get_user_data(username, 'ce_strike_offset'))))
         except (ValueError, TypeError):
             pass
@@ -928,8 +919,6 @@ def index():
     return render_template_string(
         TEMPLATE,
         username=username,
-        atm_ce_plus20=get_user_data(username, 'atm_ce_plus20'),
-        atm_pe_plus20=get_user_data(username, 'atm_pe_plus20'),
         symbol_prefix=get_user_data(username, 'symbol_prefix'),
         ce_strike_offset=get_user_data(username, 'ce_strike_offset'),
         pe_strike_offset=get_user_data(username, 'pe_strike_offset'),
@@ -957,8 +946,6 @@ def fetch_option_chain():
         # Get user-specific data
         atm_strike = get_user_data(username, 'atm_strike')
         initial_data = get_user_data(username, 'initial_data')
-        atm_ce_plus20 = get_user_data(username, 'atm_ce_plus20')
-        atm_pe_plus20 = get_user_data(username, 'atm_pe_plus20')
         symbol_prefix = get_user_data(username, 'symbol_prefix')
         ce_strike_offset = get_user_data(username, 'ce_strike_offset')
         pe_strike_offset = get_user_data(username, 'pe_strike_offset')
@@ -1023,10 +1010,10 @@ def fetch_option_chain():
                 ce_ltp = getattr(row, "CE_LTP", None)
                 pe_ltp = getattr(row, "PE_LTP", None)
 
-                # CE order at offset strike
+                # CE order at offset strike (using fixed threshold)
                 if strike == ce_target_strike and ce_ltp is not None:
                     initial_ce = next((item["CE_LTP"] for item in initial_data if item["strike_price"] == strike), None)
-                    if initial_ce is not None and ce_ltp > initial_ce + atm_ce_plus20:
+                    if initial_ce is not None and ce_ltp > initial_ce + FIXED_CE_THRESHOLD:
                         signal_name = f"CE_OFFSET_{strike}"
                         if signal_name not in placed_orders:
                             signals.append(f"{strike} {ce_ltp} CE Offset Strike")
@@ -1035,10 +1022,10 @@ def fetch_option_chain():
                             set_user_data(username, 'signals', signals)
                             set_user_data(username, 'placed_orders', placed_orders)
 
-                # PE order at offset strike
+                # PE order at offset strike (using fixed threshold)
                 if strike == pe_target_strike and pe_ltp is not None:
                     initial_pe = next((item["PE_LTP"] for item in initial_data if item["strike_price"] == strike), None)
-                    if initial_pe is not None and pe_ltp > initial_pe + atm_pe_plus20:
+                    if initial_pe is not None and pe_ltp > initial_pe + FIXED_PE_THRESHOLD:
                         signal_name = f"PE_OFFSET_{strike}"
                         if signal_name not in placed_orders:
                             signals.append(f"{strike} {pe_ltp} PE Offset Strike")
@@ -1314,6 +1301,16 @@ TEMPLATE = """
       text-align: center;
       border: 1px solid #ffeeba;
     }
+    .threshold-info {
+      background: #e8f5e8;
+      color: #2e7d32;
+      padding: 10px;
+      border-radius: 5px;
+      margin-bottom: 20px;
+      text-align: center;
+      border: 1px solid #c8e6c9;
+      font-weight: bold;
+    }
   </style>
   <script>
     var atmStrike = null;
@@ -1321,6 +1318,10 @@ TEMPLATE = """
     var initialOI = {};
     var initialVolume = {};
     var signals = [];
+
+    // Fixed thresholds
+    const FIXED_CE_THRESHOLD = 20;
+    const FIXED_PE_THRESHOLD = 20;
 
     // Helper function to format numbers in crores
     function formatInCrores(value) {
@@ -1512,17 +1513,14 @@ TEMPLATE = """
         let peOffsetLive = data.find(r => r.strike_price === peOffsetStrike);
         signals = [];
 
-        let atm_ce_plus20 = parseFloat(document.getElementById("atm_ce_plus20").value) || 20;
-        let atm_pe_plus20 = parseFloat(document.getElementById("atm_pe_plus20").value) || 20;
-
         if(ceOffsetLive){
-            if(ceOffsetLive.CE_LTP > (initialLTP[ceOffsetStrike]?.CE + atm_ce_plus20)){
+            if(ceOffsetLive.CE_LTP > (initialLTP[ceOffsetStrike]?.CE + FIXED_CE_THRESHOLD)){
                 signals.push("CE Offset Strike");
             }
         }
 
         if(peOffsetLive){
-            if(peOffsetLive.PE_LTP > (initialLTP[peOffsetStrike]?.PE + atm_pe_plus20)){
+            if(peOffsetLive.PE_LTP > (initialLTP[peOffsetStrike]?.PE + FIXED_PE_THRESHOLD)){
                 signals.push("PE Offset Strike");
             }
         }
@@ -1601,7 +1599,7 @@ TEMPLATE = """
                 
                 // Calculate Volume change
                 let ce_volume_change = row.CE_Volume - initialVolume[row.strike_price]?.CE;
-                let pe_volume_change = row.PE_Volume - initialVolume[row.strike_price]?.PE;
+                let pe_volume_change = row.CE_Volume - initialVolume[row.strike_price]?.PE;
                 
                 CE_OI_display = `${formatInCrores(row.CE_OI)} (${ce_oi_change >= 0 ? '+' : ''}${formatInCrores(ce_oi_change)})`;
                 PE_OI_display = `${formatInCrores(row.PE_OI)} (${pe_oi_change >= 0 ? '+' : ''}${formatInCrores(pe_oi_change)})`;
@@ -1705,6 +1703,10 @@ TEMPLATE = """
   </div>
   {% endif %}
 
+  <div class="threshold-info">
+    📊 Wait and Watch and have patience....
+  </div>
+
   <div class="bot-control">
     <div id="botStatus">
       <span class="bot-status status-stopped">⏸️ Bot Stopped</span>
@@ -1740,11 +1742,6 @@ TEMPLATE = """
   </div>
 
   <form method="POST" action="/">
-    <label>CE Threshold (+ over initial):</label>
-    <input type="number" id="atm_ce_plus20" name="atm_ce_plus20" step="0.1" value="{{ atm_ce_plus20 }}" required>
-    <label>PE Threshold (+ over initial):</label>
-    <input type="number" id="atm_pe_plus20" name="atm_pe_plus20" step="0.1" value="{{ atm_pe_plus20 }}" required>
-    <br><br>
     <label>CE Strike Offset (from ATM):</label>
     <input type="number" id="ce_strike_offset" name="ce_strike_offset" value="{{ ce_strike_offset }}" required>
     <label>PE Strike Offset (from ATM):</label>
@@ -1791,6 +1788,7 @@ if __name__ == "__main__":
     print("✅ Each user has isolated trading environment!")
     print("✅ Background bot available per user!")
     print("✅ OI and Volume values displayed in crores!")
+    print("✅ CE/PE thresholds FIXED at 20 points!")
     print("✅ Automatic session cleanup and expiration!")
     print("="*60 + "\n")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
