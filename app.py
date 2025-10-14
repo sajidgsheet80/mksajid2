@@ -1,54 +1,115 @@
 from fyers_apiv3 import fyersModel
-from flask import Flask, request, render_template_string, jsonify, redirect
+from flask import Flask, request, render_template_string, jsonify, redirect, session, url_for
 import webbrowser
 import pandas as pd
 import os
 import threading
 import time
 from datetime import datetime
+import hashlib
+import json
+from functools import wraps
 
-# ---- Credentials ----
-client_id = "VMS68P9EK0-100"
-secret_key = "ZJ0CFWZEL1"
-redirect_uri = "http://127.0.0.1:5000/callback"
-grant_type = "authorization_code"
-response_type = "code"
-state = "sample"
-auth_file = "auth_code.txt"
-
-# ---- Session ----
-appSession = fyersModel.SessionModel(
-    client_id=client_id,
-    secret_key=secret_key,
-    redirect_uri=redirect_uri,
-    response_type=response_type,
-    grant_type=grant_type,
-    state=state
-)
+# ---- User Management File ----
+USERS_FILE = "users_data.txt"
 
 # ---- Flask ----
 app = Flask(__name__)
-app.secret_key = "sajid_secret"
+app.secret_key = "sajid_secret_key_2024"
 
-# ---- Globals ----
-access_token_global = None
-fyers = None
-atm_strike = None
-initial_data = None
+# ---- User Sessions Storage ----
+user_sessions = {}
 
-atm_ce_plus20 = 20
-atm_pe_plus20 = 20
-symbol_prefix = "NSE:NIFTY25"
-ce_strike_offset = -300  # Default offset for CE strike (ATM - 300)
-pe_strike_offset = 300   # Default offset for PE strike (ATM + 300)
+# ---- User-specific Globals (stored per user) ----
+def init_user_data(username):
+    """Initialize user-specific data"""
+    if username not in user_sessions:
+        user_sessions[username] = {
+            'fyers': None,
+            'token': None,
+            'app_session': None,
+            'atm_strike': None,
+            'initial_data': None,
+            'atm_ce_plus20': 20,
+            'atm_pe_plus20': 20,
+            'symbol_prefix': "NSE:NIFTY25",
+            'ce_strike_offset': -300,
+            'pe_strike_offset': 300,
+            'signals': [],
+            'placed_orders': set(),
+            'bot_running': False,
+            'bot_thread': None
+        }
 
-signals = []
-placed_orders = set()
+# ---- Helper Functions ----
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
 
-# Background bot control
-bot_running = False
-bot_thread = None
+def load_users():
+    if not os.path.exists(USERS_FILE):
+        return {}
+    users = {}
+    try:
+        with open(USERS_FILE, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    data = json.loads(line)
+                    users[data['username']] = data
+    except Exception as e:
+        print(f"Error loading users: {e}")
+    return users
 
+def save_user(username, password, email, phone, fyers_client_id, fyers_secret_key):
+    user_data = {
+        'username': username,
+        'password': hash_password(password),
+        'email': email,
+        'phone': phone,
+        'fyers_client_id': fyers_client_id,
+        'fyers_secret_key': fyers_secret_key
+    }
+    with open(USERS_FILE, 'a') as f:
+        f.write(json.dumps(user_data) + '\n')
+
+def verify_user(username, password):
+    users = load_users()
+    if username in users:
+        return users[username]['password'] == hash_password(password)
+    return False
+
+def get_user_info(username):
+    users = load_users()
+    return users.get(username, {})
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'username' not in session:
+            return redirect(url_for('signin'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def get_user_fyers_session(username):
+    """Get user's Fyers session"""
+    init_user_data(username)
+    return user_sessions[username].get('fyers'), user_sessions[username].get('token')
+
+def set_user_fyers_session(username, fyers, token):
+    """Set user's Fyers session"""
+    init_user_data(username)
+    user_sessions[username]['fyers'] = fyers
+    user_sessions[username]['token'] = token
+
+def get_user_data(username, key):
+    """Get user-specific data"""
+    init_user_data(username)
+    return user_sessions[username].get(key)
+
+def set_user_data(username, key, value):
+    """Set user-specific data"""
+    init_user_data(username)
+    user_sessions[username][key] = value
 
 def format_in_crores(value):
     """Format a number in crores (1 crore = 10 million)"""
@@ -64,39 +125,62 @@ def format_in_crores(value):
         return str(value)
 
 
-def load_auth_code():
-    if os.path.exists(auth_file):
-        with open(auth_file, "r") as f:
-            return f.read().strip()
-    return None
+def create_user_fyers_session(username):
+    """Create Fyers session for specific user"""
+    user_info = get_user_info(username)
+    client_id = user_info.get('fyers_client_id')
+    secret_key = user_info.get('fyers_secret_key')
+    
+    if not client_id or not secret_key:
+        return None
+    
+    redirect_uri = "http://127.0.0.1:5000/callback"
+    return fyersModel.SessionModel(
+        client_id=client_id,
+        secret_key=secret_key,
+        redirect_uri=redirect_uri,
+        response_type="code",
+        grant_type="authorization_code",
+        state=username  # Use username as state for security
+    )
 
 
-def save_auth_code(auth_code):
-    with open(auth_file, "w") as f:
-        f.write(auth_code)
-
-
-def init_fyers(auth_code):
-    global access_token_global, fyers
+def init_user_fyers(username, auth_code):
+    """Initialize Fyers for specific user"""
     try:
+        appSession = user_sessions[username].get('app_session')
+        if not appSession:
+            return False
+            
         appSession.set_token(auth_code)
         token_response = appSession.generate_token()
-        access_token_global = token_response.get("access_token")
+        access_token = token_response.get("access_token")
+        
+        user_info = get_user_info(username)
+        client_id = user_info.get('fyers_client_id')
+        
         fyers = fyersModel.FyersModel(
             client_id=client_id,
-            token=access_token_global,
+            token=access_token,
             is_async=False,
             log_path=""
         )
-        print("✅ Fyers session initialized from auth code.")
+        
+        set_user_fyers_session(username, fyers, access_token)
+        print(f"✅ Fyers session initialized for user: {username}")
+        return True
     except Exception as e:
-        print("❌ Failed to init Fyers:", e)
+        print(f"❌ Failed to init Fyers for {username}: {e}")
+        return False
 
 
-def place_order(symbol, price, side):
+def place_order(username, symbol, price, side):
+    """Place order for specific user"""
+    fyers, _ = get_user_fyers_session(username)
+    if fyers is None:
+        return None
+    
     try:
-        if fyers is None:
-            return None
         data = {
             "symbol": symbol,
             "qty": 75,
@@ -108,23 +192,23 @@ def place_order(symbol, price, side):
             "validity": "DAY",
             "disclosedQty": 0,
             "offlineOrder": False,
-            "orderTag": "signalorder"
+            "orderTag": f"{username}_signalorder"
         }
         response = fyers.place_order(data=data)
-        print("✅ Order placed:", response)
+        print(f"✅ Order placed by {username}: {response}")
         return response
     except Exception as e:
-        print("❌ Order error:", e)
+        print(f"❌ Order error for {username}: {e}")
         return None
 
 
-def exit_position(symbol, qty, side, productType="INTRADAY"):
-    """Exit a specific position"""
+def exit_position(username, symbol, qty, side, productType="INTRADAY"):
+    """Exit a specific position for user"""
+    fyers, _ = get_user_fyers_session(username)
     if fyers is None:
         return {"error": "⚠️ Please login first!"}
     
     try:
-        # Place market order for immediate exit
         data = {
             "symbol": symbol,
             "qty": qty,
@@ -136,28 +220,28 @@ def exit_position(symbol, qty, side, productType="INTRADAY"):
             "validity": "DAY",
             "disclosedQty": 0,
             "offlineOrder": False,
-            "orderTag": "exitposition"
+            "orderTag": f"{username}_exitposition"
         }
         
         response = fyers.place_order(data=data)
-        print(f"✅ Exit order placed for {symbol}: {response}")
+        print(f"✅ Exit order placed for {username} - {symbol}: {response}")
         return {
             "message": f"Exit order placed for {symbol}",
             "response": response
         }
         
     except Exception as e:
-        print(f"❌ Error exiting position {symbol}: {e}")
+        print(f"❌ Error exiting position {username} - {symbol}: {e}")
         return {"error": str(e)}
 
 
-def exit_all_positions():
-    """Exit all open positions"""
+def exit_all_positions(username):
+    """Exit all open positions for user"""
+    fyers, _ = get_user_fyers_session(username)
     if fyers is None:
         return {"error": "⚠️ Please login first!"}
     
     try:
-        # Get all open positions
         positions = fyers.positions()
         
         if not positions or "netPositions" not in positions:
@@ -167,15 +251,12 @@ def exit_all_positions():
         exit_results = []
         
         for pos in open_positions:
-            # Only exit if position is open and has quantity
             if int(pos.get("netQty", 0)) != 0:
                 symbol = pos["symbol"]
-                qty = abs(int(pos["netQty"]))  # Use absolute value
-                # Determine side: if netQty is positive, we need to sell (side=-1)
-                # if netQty is negative, we need to buy (side=1)
+                qty = abs(int(pos["netQty"]))
                 side = -1 if int(pos["netQty"]) > 0 else 1
                 
-                result = exit_position(symbol, qty, side, pos.get("productType", "INTRADAY"))
+                result = exit_position(username, symbol, qty, side, pos.get("productType", "INTRADAY"))
                 exit_results.append({
                     "symbol": symbol,
                     "qty": qty,
@@ -189,45 +270,52 @@ def exit_all_positions():
         }
         
     except Exception as e:
-        print(f"❌ Error exiting positions: {e}")
+        print(f"❌ Error exiting positions for {username}: {e}")
         return {"error": str(e)}
 
 
-def background_bot_worker():
-    """Background thread that continuously monitors and places orders"""
-    global bot_running, fyers, atm_strike, initial_data, placed_orders, signals
-    global atm_ce_plus20, atm_pe_plus20, symbol_prefix, ce_strike_offset, pe_strike_offset
-
-    print("🤖 Background bot started - will run even if browser is closed")
-
-    while bot_running:
+def background_bot_worker(username):
+    """Background thread for specific user"""
+    print(f"🤖 Background bot started for {username}")
+    
+    while get_user_data(username, 'bot_running'):
+        fyers, _ = get_user_fyers_session(username)
         if fyers is None:
-            print("⚠️ Waiting for login...")
+            print(f"⚠️ {username}: Waiting for login...")
             time.sleep(5)
             continue
 
         try:
+            # Get user-specific settings
+            atm_strike = get_user_data(username, 'atm_strike')
+            initial_data = get_user_data(username, 'initial_data')
+            atm_ce_plus20 = get_user_data(username, 'atm_ce_plus20')
+            atm_pe_plus20 = get_user_data(username, 'atm_pe_plus20')
+            symbol_prefix = get_user_data(username, 'symbol_prefix')
+            ce_strike_offset = get_user_data(username, 'ce_strike_offset')
+            pe_strike_offset = get_user_data(username, 'pe_strike_offset')
+            signals = get_user_data(username, 'signals')
+            placed_orders = get_user_data(username, 'placed_orders')
+
             data = {"symbol": "NSE:NIFTY50-INDEX", "strikecount": 20, "timestamp": ""}
             response = fyers.optionchain(data=data)
 
             if "data" not in response or "optionsChain" not in response["data"]:
-                print(f"Invalid response from API")
+                print(f"{username}: Invalid response from API")
                 time.sleep(2)
                 continue
 
             options_data = response["data"]["optionsChain"]
             if not options_data:
-                print("No options data found!")
+                print(f"{username}: No options data found!")
                 time.sleep(2)
                 continue
 
             df = pd.DataFrame(options_data)
             
-            # Create separate DataFrames for CE and PE options
             ce_df = df[df['option_type'] == 'CE'].copy()
             pe_df = df[df['option_type'] == 'PE'].copy()
             
-            # Merge CE and PE data on strike_price
             df_pivot = pd.merge(
                 ce_df[['strike_price', 'ltp', 'oi', 'volume']],
                 pe_df[['strike_price', 'ltp', 'oi', 'volume']],
@@ -235,7 +323,6 @@ def background_bot_worker():
                 suffixes=('_CE', '_PE')
             )
             
-            # Rename columns for clarity
             df_pivot = df_pivot.rename(columns={
                 'ltp_CE': 'CE_LTP',
                 'oi_CE': 'CE_OI',
@@ -245,7 +332,7 @@ def background_bot_worker():
                 'volume_PE': 'PE_Volume'
             })
 
-            # ---- ATM detection ----
+            # ATM detection
             if atm_strike is None:
                 nifty_spot = response["data"].get(
                     "underlyingValue",
@@ -255,13 +342,17 @@ def background_bot_worker():
                 initial_data = df_pivot.to_dict(orient="records")
                 signals.clear()
                 placed_orders.clear()
-                print(f"📍 ATM Strike detected: {atm_strike}")
+                set_user_data(username, 'atm_strike', atm_strike)
+                set_user_data(username, 'initial_data', initial_data)
+                set_user_data(username, 'signals', signals)
+                set_user_data(username, 'placed_orders', placed_orders)
+                print(f"{username}: 📍 ATM Strike detected: {atm_strike}")
 
-            # ---- Calculate target strikes ----
-            ce_target_strike = atm_strike + ce_strike_offset  # Usually ATM - 300
-            pe_target_strike = atm_strike + pe_strike_offset  # Usually ATM + 300
+            # Calculate target strikes
+            ce_target_strike = atm_strike + ce_strike_offset
+            pe_target_strike = atm_strike + pe_strike_offset
 
-            # ---- Order placement for offset strikes ----
+            # Order placement for offset strikes
             for row in df_pivot.itertuples():
                 strike = row.strike_price
                 ce_ltp = getattr(row, "CE_LTP", None)
@@ -274,9 +365,11 @@ def background_bot_worker():
                         signal_name = f"CE_OFFSET_{strike}"
                         if signal_name not in placed_orders:
                             signals.append(f"{strike} {ce_ltp} CE Offset Strike")
-                            print(f"🚨 Signal: {signal_name} - Placing order")
-                            place_order(f"{symbol_prefix}{strike}CE", ce_ltp, side=1)
+                            print(f"{username}: 🚨 Signal: {signal_name} - Placing order")
+                            place_order(username, f"{symbol_prefix}{strike}CE", ce_ltp, side=1)
                             placed_orders.add(signal_name)
+                            set_user_data(username, 'signals', signals)
+                            set_user_data(username, 'placed_orders', placed_orders)
 
                 # PE order at offset strike
                 if strike == pe_target_strike and pe_ltp is not None:
@@ -285,84 +378,450 @@ def background_bot_worker():
                         signal_name = f"PE_OFFSET_{strike}"
                         if signal_name not in placed_orders:
                             signals.append(f"{strike} {pe_ltp} PE Offset Strike")
-                            print(f"🚨 Signal: {signal_name} - Placing order")
-                            place_order(f"{symbol_prefix}{strike}PE", pe_ltp, side=1)
+                            print(f"{username}: 🚨 Signal: {signal_name} - Placing order")
+                            place_order(username, f"{symbol_prefix}{strike}PE", pe_ltp, side=1)
                             placed_orders.add(signal_name)
+                            set_user_data(username, 'signals', signals)
+                            set_user_data(username, 'placed_orders', placed_orders)
 
         except Exception as e:
-            print(f"❌ Background bot error: {e}")
+            print(f"❌ Background bot error for {username}: {e}")
 
         time.sleep(2)
 
-    print("🤖 Background bot stopped")
+    print(f"🤖 Background bot stopped for {username}")
 
 
-# ---- Load auth code on startup ----
-auth_code = load_auth_code()
-if auth_code:
-    init_fyers(auth_code)
+# ---- HTML Templates ----
+SIGNIN_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sign In - Sajid Shaikh Algo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .auth-container {
+            background: white;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            width: 400px;
+        }
+        h2 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #555;
+            font-weight: bold;
+        }
+        input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+        input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        button:hover {
+            background: #5568d3;
+        }
+        .error {
+            background: #f44336;
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .success {
+            background: #4CAF50;
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .link {
+            text-align: center;
+            margin-top: 20px;
+            color: #666;
+        }
+        .link a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="auth-container">
+        <h2>🔐 Sign In</h2>
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        {% if success %}
+        <div class="success">{{ success }}</div>
+        {% endif %}
+        <form method="POST">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" name="username" required>
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" name="password" required>
+            </div>
+            <button type="submit">Sign In</button>
+        </form>
+        <div class="link">
+            Don't have an account? <a href="/signup">Sign Up</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
 
+SIGNUP_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sign Up - Sajid Shaikh Algo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+        .auth-container {
+            background: white;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            width: 450px;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+        h2 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #555;
+            font-weight: bold;
+        }
+        input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+        input:focus {
+            outline: none;
+            border-color: #f5576c;
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            background: #f5576c;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        button:hover {
+            background: #e04555;
+        }
+        .error {
+            background: #f44336;
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .link {
+            text-align: center;
+            margin-top: 20px;
+            color: #666;
+        }
+        .link a {
+            color: #f5576c;
+            text-decoration: none;
+            font-weight: bold;
+        }
+        .info {
+            background: #e3f2fd;
+            color: #1976d2;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="auth-container">
+        <h2>📝 Sign Up</h2>
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        <div class="info">
+            🔑 You need your own Fyers API credentials. Get them from: <a href="https://fyers.in/dev" target="_blank">https://fyers.in/dev</a>
+        </div>
+        <form method="POST">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" name="username" required minlength="3">
+            </div>
+            <div class="form-group">
+                <label>Email</label>
+                <input type="email" name="email" required>
+            </div>
+            <div class="form-group">
+                <label>Phone</label>
+                <input type="tel" name="phone" required pattern="[0-9]{10}">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" name="password" required minlength="6">
+            </div>
+            <div class="form-group">
+                <label>Confirm Password</label>
+                <input type="password" name="confirm_password" required>
+            </div>
+            <div class="form-group">
+                <label>Fyers Client ID (e.g., ABC001-100)</label>
+                <input type="text" name="fyers_client_id" required placeholder="Your Fyers App ID">
+            </div>
+            <div class="form-group">
+                <label>Fyers Secret Key</label>
+                <input type="password" name="fyers_secret_key" required placeholder="Your Fyers Secret Key">
+            </div>
+            <button type="submit">Sign Up</button>
+        </form>
+        <div class="link">
+            Already have an account? <a href="/signin">Sign In</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
 
-@app.route("/", methods=["GET", "POST"])
-def index():
-    global atm_ce_plus20, atm_pe_plus20, symbol_prefix, ce_strike_offset, pe_strike_offset
+# ---- Routes ----
+@app.route("/")
+def home():
+    if 'username' in session:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('signin'))
+
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
     if request.method == "POST":
-        try:
-            atm_ce_plus20 = float(request.form.get("atm_ce_plus20", atm_ce_plus20))
-        except (ValueError, TypeError):
-            atm_ce_plus20 = 20
-        try:
-            atm_pe_plus20 = float(request.form.get("atm_pe_plus20", atm_pe_plus20))
-        except (ValueError, TypeError):
-            atm_pe_plus20 = 20
-        try:
-            ce_strike_offset = int(request.form.get("ce_strike_offset", ce_strike_offset))
-        except (ValueError, TypeError):
-            ce_strike_offset = -300
-        try:
-            pe_strike_offset = int(request.form.get("pe_strike_offset", pe_strike_offset))
-        except (ValueError, TypeError):
-            pe_strike_offset = 300
-        prefix = request.form.get("symbol_prefix")
-        if prefix:
-            symbol_prefix = prefix.strip()
+        username = request.form.get("username")
+        email = request.form.get("email")
+        phone = request.form.get("phone")
+        password = request.form.get("password")
+        confirm_password = request.form.get("confirm_password")
+        fyers_client_id = request.form.get("fyers_client_id")
+        fyers_secret_key = request.form.get("fyers_secret_key")
+        
+        # Validation
+        if password != confirm_password:
+            return render_template_string(SIGNUP_TEMPLATE, error="Passwords do not match!")
+        
+        users = load_users()
+        if username in users:
+            return render_template_string(SIGNUP_TEMPLATE, error="Username already exists!")
+        
+        # Save user with Fyers credentials
+        save_user(username, password, email, phone, fyers_client_id, fyers_secret_key)
+        return redirect(url_for('signin', success="Account created successfully! Please sign in."))
+    
+    return render_template_string(SIGNUP_TEMPLATE)
 
+@app.route("/signin", methods=["GET", "POST"])
+def signin():
+    success = request.args.get('success')
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+        
+        if verify_user(username, password):
+            session['username'] = username
+            init_user_data(username)  # Initialize user session data
+            return redirect(url_for('dashboard'))
+        else:
+            return render_template_string(SIGNIN_TEMPLATE, error="Invalid username or password!")
+    
+    return render_template_string(SIGNIN_TEMPLATE, success=success)
+
+@app.route("/logout")
+def logout():
+    username = session.get('username')
+    if username and username in user_sessions:
+        # Stop bot if running
+        if get_user_data(username, 'bot_running'):
+            set_user_data(username, 'bot_running', False)
+        del user_sessions[username]
+    session.pop('username', None)
+    return redirect(url_for('signin'))
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    username = session.get('username')
     return render_template_string(
         TEMPLATE,
-        atm_ce_plus20=atm_ce_plus20,
-        atm_pe_plus20=atm_pe_plus20,
-        symbol_prefix=symbol_prefix,
-        ce_strike_offset=ce_strike_offset,
-        pe_strike_offset=pe_strike_offset,
-        bot_running=bot_running
+        username=username,
+        atm_ce_plus20=get_user_data(username, 'atm_ce_plus20'),
+        atm_pe_plus20=get_user_data(username, 'atm_pe_plus20'),
+        symbol_prefix=get_user_data(username, 'symbol_prefix'),
+        ce_strike_offset=get_user_data(username, 'ce_strike_offset'),
+        pe_strike_offset=get_user_data(username, 'pe_strike_offset'),
+        bot_running=get_user_data(username, 'bot_running')
     )
 
-
-@app.route("/login")
-def login():
+@app.route("/login_fyers")
+@login_required
+def login_fyers():
+    username = session.get('username')
+    appSession = create_user_fyers_session(username)
+    
+    if appSession is None:
+        return "❌ Fyers credentials not configured for your account!"
+    
     login_url = appSession.generate_authcode()
+    set_user_data(username, 'app_session', appSession)
+    
     webbrowser.open(login_url, new=1)
     return redirect(login_url)
 
-
 @app.route("/callback")
 def callback():
-    global access_token_global, fyers
     auth_code = request.args.get("auth_code")
+    state = request.args.get("state")  # This will be the username
+    
+    if not state:
+        return "❌ Invalid callback"
+    
+    username = state
+    
     if auth_code:
-        save_auth_code(auth_code)
-        init_fyers(auth_code)
-        return "<h2>✅ Authentication Successful! You can return to the app 🚀</h2>"
+        if init_user_fyers(username, auth_code):
+            return "<h2>✅ Authentication Successful! You can close this window and return to the app 🚀</h2>"
+    
     return "❌ Authentication failed. Please retry."
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if 'username' not in session:
+        return redirect(url_for('signin'))
+    
+    username = session.get('username')
+    
+    if request.method == "POST":
+        try:
+            set_user_data(username, 'atm_ce_plus20', float(request.form.get("atm_ce_plus20", get_user_data(username, 'atm_ce_plus20'))))
+        except (ValueError, TypeError):
+            pass
+        try:
+            set_user_data(username, 'atm_pe_plus20', float(request.form.get("atm_pe_plus20", get_user_data(username, 'atm_pe_plus20'))))
+        except (ValueError, TypeError):
+            pass
+        try:
+            set_user_data(username, 'ce_strike_offset', int(request.form.get("ce_strike_offset", get_user_data(username, 'ce_strike_offset'))))
+        except (ValueError, TypeError):
+            pass
+        try:
+            set_user_data(username, 'pe_strike_offset', int(request.form.get("pe_strike_offset", get_user_data(username, 'pe_strike_offset'))))
+        except (ValueError, TypeError):
+            pass
+        
+        prefix = request.form.get("symbol_prefix")
+        if prefix:
+            set_user_data(username, 'symbol_prefix', prefix.strip())
+
+    return render_template_string(
+        TEMPLATE,
+        username=username,
+        atm_ce_plus20=get_user_data(username, 'atm_ce_plus20'),
+        atm_pe_plus20=get_user_data(username, 'atm_pe_plus20'),
+        symbol_prefix=get_user_data(username, 'symbol_prefix'),
+        ce_strike_offset=get_user_data(username, 'ce_strike_offset'),
+        pe_strike_offset=get_user_data(username, 'pe_strike_offset'),
+        bot_running=get_user_data(username, 'bot_running')
+    )
 
 
 @app.route("/fetch")
 def fetch_option_chain():
-    global fyers, atm_strike, initial_data, atm_ce_plus20, atm_pe_plus20, signals, placed_orders, symbol_prefix
-    global ce_strike_offset, pe_strike_offset
-    if fyers is None:
+    if 'username' not in session:
         return jsonify({"error": "⚠ Please login first!"})
+    
+    username = session.get('username')
+    fyers, _ = get_user_fyers_session(username)
+    
+    if fyers is None:
+        return jsonify({"error": "⚠ Please login to Fyers first!"})
+    
     try:
+        # Get user-specific data
+        atm_strike = get_user_data(username, 'atm_strike')
+        initial_data = get_user_data(username, 'initial_data')
+        atm_ce_plus20 = get_user_data(username, 'atm_ce_plus20')
+        atm_pe_plus20 = get_user_data(username, 'atm_pe_plus20')
+        symbol_prefix = get_user_data(username, 'symbol_prefix')
+        ce_strike_offset = get_user_data(username, 'ce_strike_offset')
+        pe_strike_offset = get_user_data(username, 'pe_strike_offset')
+        signals = get_user_data(username, 'signals')
+        placed_orders = get_user_data(username, 'placed_orders')
+        bot_running = get_user_data(username, 'bot_running')
+
         data = {"symbol": "NSE:NIFTY50-INDEX", "strikecount": 20, "timestamp": ""}
         response = fyers.optionchain(data=data)
 
@@ -375,11 +834,9 @@ def fetch_option_chain():
 
         df = pd.DataFrame(options_data)
         
-        # Create separate DataFrames for CE and PE options
         ce_df = df[df['option_type'] == 'CE'].copy()
         pe_df = df[df['option_type'] == 'PE'].copy()
         
-        # Merge CE and PE data on strike_price
         df_pivot = pd.merge(
             ce_df[['strike_price', 'ltp', 'oi', 'volume']],
             pe_df[['strike_price', 'ltp', 'oi', 'volume']],
@@ -387,7 +844,6 @@ def fetch_option_chain():
             suffixes=('_CE', '_PE')
         )
         
-        # Rename columns for clarity
         df_pivot = df_pivot.rename(columns={
             'ltp_CE': 'CE_LTP',
             'oi_CE': 'CE_OI',
@@ -397,7 +853,7 @@ def fetch_option_chain():
             'volume_PE': 'PE_Volume'
         })
 
-        # ---- ATM detection ----
+        # ATM detection
         if atm_strike is None:
             nifty_spot = response["data"].get(
                 "underlyingValue",
@@ -407,12 +863,16 @@ def fetch_option_chain():
             initial_data = df_pivot.to_dict(orient="records")
             signals.clear()
             placed_orders.clear()
+            set_user_data(username, 'atm_strike', atm_strike)
+            set_user_data(username, 'initial_data', initial_data)
+            set_user_data(username, 'signals', signals)
+            set_user_data(username, 'placed_orders', placed_orders)
 
-        # ---- Calculate target strikes ----
-        ce_target_strike = atm_strike + ce_strike_offset  # Usually ATM - 300
-        pe_target_strike = atm_strike + pe_strike_offset  # Usually ATM + 300
+        # Calculate target strikes
+        ce_target_strike = atm_strike + ce_strike_offset
+        pe_target_strike = atm_strike + pe_strike_offset
 
-        # ---- Order placement for offset strikes (only if bot not running) ----
+        # Order placement for offset strikes (only if bot not running)
         if not bot_running:
             for row in df_pivot.itertuples():
                 strike = row.strike_price
@@ -426,8 +886,10 @@ def fetch_option_chain():
                         signal_name = f"CE_OFFSET_{strike}"
                         if signal_name not in placed_orders:
                             signals.append(f"{strike} {ce_ltp} CE Offset Strike")
-                            place_order(f"{symbol_prefix}{strike}CE", ce_ltp, side=1)
+                            place_order(username, f"{symbol_prefix}{strike}CE", ce_ltp, side=1)
                             placed_orders.add(signal_name)
+                            set_user_data(username, 'signals', signals)
+                            set_user_data(username, 'placed_orders', placed_orders)
 
                 # PE order at offset strike
                 if strike == pe_target_strike and pe_ltp is not None:
@@ -436,8 +898,10 @@ def fetch_option_chain():
                         signal_name = f"PE_OFFSET_{strike}"
                         if signal_name not in placed_orders:
                             signals.append(f"{strike} {pe_ltp} PE Offset Strike")
-                            place_order(f"{symbol_prefix}{strike}PE", pe_ltp, side=1)
+                            place_order(username, f"{symbol_prefix}{strike}PE", pe_ltp, side=1)
                             placed_orders.add(signal_name)
+                            set_user_data(username, 'signals', signals)
+                            set_user_data(username, 'placed_orders', placed_orders)
 
         return df_pivot.to_json(orient="records")
     except Exception as e:
@@ -447,13 +911,18 @@ def fetch_option_chain():
 @app.route("/positions")
 def get_positions():
     """Get current positions"""
-    if fyers is None:
+    if 'username' not in session:
         return jsonify({"error": "⚠ Please login first!"})
+    
+    username = session.get('username')
+    fyers, _ = get_user_fyers_session(username)
+    
+    if fyers is None:
+        return jsonify({"error": "⚠ Please login to Fyers first!"})
     
     try:
         positions = fyers.positions()
         if positions and "netPositions" in positions:
-            # Filter only open positions (netQty != 0)
             open_positions = [pos for pos in positions["netPositions"] if int(pos.get("netQty", 0)) != 0]
             return jsonify({"positions": open_positions})
         return jsonify({"positions": []})
@@ -464,63 +933,87 @@ def get_positions():
 @app.route("/exit_position", methods=["POST"])
 def exit_single_position():
     """Exit a single position"""
+    if 'username' not in session:
+        return jsonify({"error": "⚠ Please login first!"})
+    
+    username = session.get('username')
+    
     data = request.get_json()
     symbol = data.get("symbol")
     qty = data.get("qty")
     side = data.get("side")
     productType = data.get("productType", "INTRADAY")
     
-    result = exit_position(symbol, qty, side, productType)
+    result = exit_position(username, symbol, qty, side, productType)
     return jsonify(result)
 
 
 @app.route("/start_bot", methods=["POST"])
 def start_bot():
-    global bot_running, bot_thread
-
-    if fyers is None:
+    if 'username' not in session:
         return jsonify({"error": "⚠️ Please login first!"})
+    
+    username = session.get('username')
+    fyers, _ = get_user_fyers_session(username)
+    
+    if fyers is None:
+        return jsonify({"error": "⚠️ Please login to Fyers first!"})
 
-    if bot_running:
+    if get_user_data(username, 'bot_running'):
         return jsonify({"error": "⚠️ Bot is already running!"})
 
-    bot_running = True
-    bot_thread = threading.Thread(target=background_bot_worker, daemon=True)
+    set_user_data(username, 'bot_running', True)
+    bot_thread = threading.Thread(target=background_bot_worker, args=(username,), daemon=True)
     bot_thread.start()
+    set_user_data(username, 'bot_thread', bot_thread)
 
     return jsonify({"message": "✅ Bot started! Running in background - you can close browser now!"})
 
 
 @app.route("/stop_bot", methods=["POST"])
 def stop_bot():
-    global bot_running
-    bot_running = False
+    if 'username' not in session:
+        return jsonify({"error": "⚠️ Please login first!"})
+    
+    username = session.get('username')
+    set_user_data(username, 'bot_running', False)
     return jsonify({"message": "✅ Bot stopped!"})
 
 
 @app.route("/exit_all", methods=["POST"])
 def exit_all():
     """Exit all open positions"""
-    result = exit_all_positions()
+    if 'username' not in session:
+        return jsonify({"error": "⚠ Please login first!"})
+    
+    username = session.get('username')
+    result = exit_all_positions(username)
     return jsonify(result)
 
 
 @app.route("/bot_status")
 def bot_status():
+    if 'username' not in session:
+        return jsonify({"error": "⚠ Please login first!"})
+    
+    username = session.get('username')
     return jsonify({
-        "running": bot_running,
-        "signals": signals,
-        "placed_orders": list(placed_orders)
+        "running": get_user_data(username, 'bot_running'),
+        "signals": get_user_data(username, 'signals'),
+        "placed_orders": list(get_user_data(username, 'placed_orders'))
     })
 
 
 @app.route("/reset", methods=["POST"])
 def reset_orders():
-    global placed_orders, signals, atm_strike, initial_data, ce_strike_offset, pe_strike_offset
-    placed_orders.clear()
-    signals.clear()
-    atm_strike = None
-    initial_data = None
+    if 'username' not in session:
+        return jsonify({"error": "⚠ Please login first!"})
+    
+    username = session.get('username')
+    set_user_data(username, 'placed_orders', set())
+    set_user_data(username, 'signals', [])
+    set_user_data(username, 'atm_strike', None)
+    set_user_data(username, 'initial_data', None)
     return jsonify({"message": "✅ Reset successful! You can trade again."})
 
 
@@ -532,7 +1025,42 @@ TEMPLATE = """
   <title>Sajid Shaikh Algo Software</title>
   <style>
     body { font-family: Arial, sans-serif; background: #f4f4f9; padding: 20px; }
-    h2 { color: #1a73e8; }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: white;
+      padding: 20px;
+      border-radius: 5px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      margin-bottom: 20px;
+    }
+    .user-info {
+      display: flex;
+      align-items: center;
+      gap: 15px;
+    }
+    .user-badge {
+      background: #667eea;
+      color: white;
+      padding: 8px 15px;
+      border-radius: 20px;
+      font-weight: bold;
+    }
+    .logout-btn {
+      background: #f44336;
+      color: white;
+      padding: 8px 15px;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-block;
+    }
+    .logout-btn:hover {
+      background: #d32f2f;
+    }
+    h2 { color: #1a73e8; margin: 0; }
     .bot-control {
       background: #fff;
       padding: 15px;
@@ -882,7 +1410,7 @@ TEMPLATE = """
     }
 
     setInterval(fetchChain, 2000);
-    setInterval(fetchPositions, 3000); // Update positions every 3 seconds
+    setInterval(fetchPositions, 3000);
     setInterval(checkBotStatus, 3000);
     window.onload = function(){
         fetchChain();
@@ -903,7 +1431,15 @@ TEMPLATE = """
   </script>
 </head>
 <body>
-  <h2>Sajid Shaikh Algo Software : +91 9834370368</h2>
+  <div class="header">
+    <div>
+      <h2>Sajid Shaikh Algo Software : +91 9834370368</h2>
+    </div>
+    <div class="user-info">
+      <div class="user-badge">👤 {{ username }}</div>
+      <a href="/logout" class="logout-btn">Logout</a>
+    </div>
+  </div>
 
   <div class="bot-control">
     <div id="botStatus">
@@ -915,7 +1451,7 @@ TEMPLATE = """
     <button id="startBtn" class="btn-start" onclick="startBackgroundBot()">▶️ Start Background Bot</button>
     <button id="stopBtn" class="btn-stop" onclick="stopBackgroundBot()" disabled>⏸️ Stop Bot</button>
     <button class="btn-exit" onclick="exitAllPositions()">🚪 Exit All Positions</button>
-    <a href="/login" target="_blank">🔑 Login</a>
+    <a href="/login_fyers" target="_blank">🔑 Login to Fyers</a>
   </div>
 
   <div class="positions-section">
@@ -982,11 +1518,12 @@ TEMPLATE = """
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
     print("\n" + "="*60)
-    print("🚀 Sajid Shaikh Algo Trading Bot")
+    print("🚀 Sajid Shaikh Multi-User Algo Trading Bot")
     print("="*60)
     print(f"📍 Server: http://127.0.0.1:{port}")
-    print("✅ Background bot available - runs even when browser closed!")
-    print("✅ Positions display with individual exit buttons added!")
-    print("✅ OI and Volume values now displayed in crores!")
+    print("✅ Multi-user support with individual Fyers credentials!")
+    print("✅ Each user has isolated trading environment!")
+    print("✅ Background bot available per user!")
+    print("✅ OI and Volume values displayed in crores!")
     print("="*60 + "\n")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
