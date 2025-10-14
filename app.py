@@ -8,10 +8,12 @@ import time
 from datetime import datetime
 import hashlib
 import json
+import uuid
 from functools import wraps
 
 # ---- User Management File ----
 USERS_FILE = "users_data.txt"
+ACTIVE_SESSIONS_FILE = "active_sessions.txt"
 
 # ---- Flask ----
 app = Flask(__name__)
@@ -19,6 +21,7 @@ app.secret_key = "sajid_secret_key_2024"
 
 # ---- User Sessions Storage ----
 user_sessions = {}
+active_user_sessions = {}  # Track one session per user
 
 # ---- User-specific Globals (stored per user) ----
 def init_user_data(username):
@@ -38,8 +41,72 @@ def init_user_data(username):
             'signals': [],
             'placed_orders': set(),
             'bot_running': False,
-            'bot_thread': None
+            'bot_thread': None,
+            'session_id': None
         }
+
+def load_active_sessions():
+    """Load active sessions from file"""
+    if not os.path.exists(ACTIVE_SESSIONS_FILE):
+        return {}
+    try:
+        with open(ACTIVE_SESSIONS_FILE, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading active sessions: {e}")
+        return {}
+
+def save_active_sessions():
+    """Save active sessions to file"""
+    try:
+        with open(ACTIVE_SESSIONS_FILE, 'w') as f:
+            json.dump(active_user_sessions, f)
+    except Exception as e:
+        print(f"Error saving active sessions: {e}")
+
+def invalidate_user_session(username):
+    """Invalidate any existing session for a user"""
+    if username in active_user_sessions:
+        old_session_id = active_user_sessions[username]
+        # Clear user data for old session
+        if username in user_sessions:
+            # Stop bot if running
+            if user_sessions[username].get('bot_running'):
+                user_sessions[username]['bot_running'] = False
+            del user_sessions[username]
+        # Remove from active sessions
+        del active_user_sessions[username]
+        save_active_sessions()
+        print(f"⚠️ Terminated previous session for user: {username}")
+        return old_session_id
+    return None
+
+def register_user_session(username, session_id):
+    """Register a new session for a user"""
+    # Invalidate any existing session first
+    invalidate_user_session(username)
+    # Register new session
+    active_user_sessions[username] = session_id
+    save_active_sessions()
+    init_user_data(username)
+    user_sessions[username]['session_id'] = session_id
+    print(f"✅ New session registered for user: {username}")
+
+def cleanup_expired_sessions():
+    """Clean up expired sessions (run periodically)"""
+    current_time = time.time()
+    expired_users = []
+    
+    for username, session_id in active_user_sessions.items():
+        if username in user_sessions:
+            # Check if session is still valid (has recent activity)
+            last_activity = user_sessions[username].get('last_activity', 0)
+            if current_time - last_activity > 3600:  # 1 hour timeout
+                expired_users.append(username)
+    
+    for username in expired_users:
+        invalidate_user_session(username)
+        print(f"🧹 Cleaned up expired session for: {username}")
 
 # ---- Helper Functions ----
 def hash_password(password):
@@ -87,6 +154,19 @@ def login_required(f):
     def decorated_function(*args, **kwargs):
         if 'username' not in session:
             return redirect(url_for('signin'))
+        
+        # Verify session is still valid
+        username = session['username']
+        session_id = session.get('session_id')
+        
+        if not session_id or active_user_sessions.get(username) != session_id:
+            session.clear()
+            return redirect(url_for('signin', error="Session expired. Please login again."))
+        
+        # Update last activity
+        if username in user_sessions:
+            user_sessions[username]['last_activity'] = time.time()
+        
         return f(*args, **kwargs)
     return decorated_function
 
@@ -110,6 +190,7 @@ def set_user_data(username, key, value):
     """Set user-specific data"""
     init_user_data(username)
     user_sessions[username][key] = value
+    user_sessions[username]['last_activity'] = time.time()
 
 def format_in_crores(value):
     """Format a number in crores (1 crore = 10 million)"""
@@ -471,6 +552,14 @@ SIGNIN_TEMPLATE = """
             margin-bottom: 20px;
             text-align: center;
         }
+        .warning {
+            background: #ff9800;
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
         .link {
             text-align: center;
             margin-top: 20px;
@@ -481,16 +570,31 @@ SIGNIN_TEMPLATE = """
             text-decoration: none;
             font-weight: bold;
         }
+        .session-info {
+            background: #e3f2fd;
+            color: #1976d2;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            font-size: 12px;
+            text-align: center;
+        }
     </style>
 </head>
 <body>
     <div class="auth-container">
         <h2>🔐 Sign In</h2>
+        <div class="session-info">
+            ℹ️ One session per user. New login will terminate previous session.
+        </div>
         {% if error %}
         <div class="error">{{ error }}</div>
         {% endif %}
         {% if success %}
         <div class="success">{{ success }}</div>
+        {% endif %}
+        {% if warning %}
+        <div class="warning">{{ warning }}</div>
         {% endif %}
         <form method="POST">
             <div class="form-group">
@@ -611,7 +715,8 @@ SIGNUP_TEMPLATE = """
         <div class="error">{{ error }}</div>
         {% endif %}
         <div class="info">
-            🔑 You need your own Fyers API credentials. Get them from: <a href="https://fyers.in/dev" target="_blank">https://fyers.in/dev</a>
+            🔑 You need your own Fyers API credentials. Get them from: <a href="https://fyers.in/dev" target="_blank">https://fyers.in/dev</a><br>
+            🔒 One session per user. New login will terminate previous session.
         </div>
         <form method="POST">
             <div class="form-group">
@@ -652,6 +757,9 @@ SIGNUP_TEMPLATE = """
 </html>
 """
 
+# ---- Load active sessions on startup ----
+active_user_sessions = load_active_sessions()
+
 # ---- Routes ----
 @app.route("/")
 def home():
@@ -687,29 +795,56 @@ def signup():
 @app.route("/signin", methods=["GET", "POST"])
 def signin():
     success = request.args.get('success')
+    error = request.args.get('error')
+    warning = request.args.get('warning')
+    
     if request.method == "POST":
         username = request.form.get("username")
         password = request.form.get("password")
         
         if verify_user(username, password):
+            # Generate unique session ID
+            session_id = str(uuid.uuid4())
+            
+            # Check if user has existing session
+            old_session_id = invalidate_user_session(username)
+            
+            # Register new session
+            register_user_session(username, session_id)
+            
+            # Set Flask session
             session['username'] = username
-            init_user_data(username)  # Initialize user session data
-            return redirect(url_for('dashboard'))
+            session['session_id'] = session_id
+            session['login_time'] = time.time()
+            
+            warning_msg = None
+            if old_session_id:
+                warning_msg = "Previous session terminated. You are now logged in from this device."
+            
+            return redirect(url_for('dashboard', warning=warning_msg))
         else:
             return render_template_string(SIGNIN_TEMPLATE, error="Invalid username or password!")
     
-    return render_template_string(SIGNIN_TEMPLATE, success=success)
+    return render_template_string(SIGNIN_TEMPLATE, success=success, error=error, warning=warning)
 
 @app.route("/logout")
 def logout():
     username = session.get('username')
-    if username and username in user_sessions:
+    if username:
         # Stop bot if running
-        if get_user_data(username, 'bot_running'):
-            set_user_data(username, 'bot_running', False)
-        del user_sessions[username]
-    session.pop('username', None)
-    return redirect(url_for('signin'))
+        if username in user_sessions and user_sessions[username].get('bot_running'):
+            user_sessions[username]['bot_running'] = False
+        
+        # Invalidate session
+        invalidate_user_session(username)
+        
+        # Clear user session data
+        if username in user_sessions:
+            del user_sessions[username]
+    
+    # Clear Flask session
+    session.clear()
+    return redirect(url_for('signin', success="You have been logged out successfully."))
 
 @app.route("/dashboard")
 @login_required
@@ -750,6 +885,10 @@ def callback():
         return "❌ Invalid callback"
     
     username = state
+    
+    # Verify user session is still valid
+    if username not in active_user_sessions:
+        return "❌ Session expired. Please login again."
     
     if auth_code:
         if init_user_fyers(username, auth_code):
@@ -804,6 +943,11 @@ def fetch_option_chain():
         return jsonify({"error": "⚠ Please login first!"})
     
     username = session.get('username')
+    
+    # Verify session is still valid
+    if active_user_sessions.get(username) != session.get('session_id'):
+        return jsonify({"error": "Session expired. Please login again."})
+    
     fyers, _ = get_user_fyers_session(username)
     
     if fyers is None:
@@ -915,6 +1059,11 @@ def get_positions():
         return jsonify({"error": "⚠ Please login first!"})
     
     username = session.get('username')
+    
+    # Verify session is still valid
+    if active_user_sessions.get(username) != session.get('session_id'):
+        return jsonify({"error": "Session expired. Please login again."})
+    
     fyers, _ = get_user_fyers_session(username)
     
     if fyers is None:
@@ -938,6 +1087,10 @@ def exit_single_position():
     
     username = session.get('username')
     
+    # Verify session is still valid
+    if active_user_sessions.get(username) != session.get('session_id'):
+        return jsonify({"error": "Session expired. Please login again."})
+    
     data = request.get_json()
     symbol = data.get("symbol")
     qty = data.get("qty")
@@ -954,6 +1107,11 @@ def start_bot():
         return jsonify({"error": "⚠️ Please login first!"})
     
     username = session.get('username')
+    
+    # Verify session is still valid
+    if active_user_sessions.get(username) != session.get('session_id'):
+        return jsonify({"error": "Session expired. Please login again."})
+    
     fyers, _ = get_user_fyers_session(username)
     
     if fyers is None:
@@ -976,6 +1134,11 @@ def stop_bot():
         return jsonify({"error": "⚠️ Please login first!"})
     
     username = session.get('username')
+    
+    # Verify session is still valid
+    if active_user_sessions.get(username) != session.get('session_id'):
+        return jsonify({"error": "Session expired. Please login again."})
+    
     set_user_data(username, 'bot_running', False)
     return jsonify({"message": "✅ Bot stopped!"})
 
@@ -987,6 +1150,11 @@ def exit_all():
         return jsonify({"error": "⚠ Please login first!"})
     
     username = session.get('username')
+    
+    # Verify session is still valid
+    if active_user_sessions.get(username) != session.get('session_id'):
+        return jsonify({"error": "Session expired. Please login again."})
+    
     result = exit_all_positions(username)
     return jsonify(result)
 
@@ -997,6 +1165,11 @@ def bot_status():
         return jsonify({"error": "⚠ Please login first!"})
     
     username = session.get('username')
+    
+    # Verify session is still valid
+    if active_user_sessions.get(username) != session.get('session_id'):
+        return jsonify({"error": "Session expired. Please login again."})
+    
     return jsonify({
         "running": get_user_data(username, 'bot_running'),
         "signals": get_user_data(username, 'signals'),
@@ -1010,11 +1183,32 @@ def reset_orders():
         return jsonify({"error": "⚠ Please login first!"})
     
     username = session.get('username')
+    
+    # Verify session is still valid
+    if active_user_sessions.get(username) != session.get('session_id'):
+        return jsonify({"error": "Session expired. Please login again."})
+    
     set_user_data(username, 'placed_orders', set())
     set_user_data(username, 'signals', [])
     set_user_data(username, 'atm_strike', None)
     set_user_data(username, 'initial_data', None)
     return jsonify({"message": "✅ Reset successful! You can trade again."})
+
+
+# ---- Background cleanup thread ----
+def cleanup_worker():
+    """Background worker to clean up expired sessions"""
+    while True:
+        try:
+            cleanup_expired_sessions()
+            time.sleep(300)  # Run every 5 minutes
+        except Exception as e:
+            print(f"Cleanup worker error: {e}")
+            time.sleep(60)
+
+# Start cleanup worker
+cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)
+cleanup_thread.start()
 
 
 # ---- HTML Template ----
@@ -1111,6 +1305,15 @@ TEMPLATE = """
     .positions-section { margin-top: 20px; }
     .positions-table { margin-top: 10px; }
     .no-positions { color: #666; font-style: italic; }
+    .session-warning {
+      background: #fff3cd;
+      color: #856404;
+      padding: 10px;
+      border-radius: 5px;
+      margin-bottom: 20px;
+      text-align: center;
+      border: 1px solid #ffeeba;
+    }
   </style>
   <script>
     var atmStrike = null;
@@ -1138,6 +1341,11 @@ TEMPLATE = """
     async function startBackgroundBot(){
         let res = await fetch("/start_bot", {method: "POST"});
         let data = await res.json();
+        if(data.error && data.error.includes("Session expired")) {
+            alert("Session expired! Redirecting to login...");
+            window.location.href = "/signin";
+            return;
+        }
         alert(data.message || data.error);
         checkBotStatus();
     }
@@ -1145,6 +1353,11 @@ TEMPLATE = """
     async function stopBackgroundBot(){
         let res = await fetch("/stop_bot", {method: "POST"});
         let data = await res.json();
+        if(data.error && data.error.includes("Session expired")) {
+            alert("Session expired! Redirecting to login...");
+            window.location.href = "/signin";
+            return;
+        }
         alert(data.message);
         checkBotStatus();
     }
@@ -1155,6 +1368,11 @@ TEMPLATE = """
         }
         let res = await fetch("/exit_all", {method: "POST"});
         let data = await res.json();
+        if(data.error && data.error.includes("Session expired")) {
+            alert("Session expired! Redirecting to login...");
+            window.location.href = "/signin";
+            return;
+        }
         if(data.error){
             alert("❌ Error exiting positions: " + data.error);
         } else {
@@ -1176,6 +1394,11 @@ TEMPLATE = """
             body: JSON.stringify({symbol, qty, side, productType})
         });
         let data = await res.json();
+        if(data.error && data.error.includes("Session expired")) {
+            alert("Session expired! Redirecting to login...");
+            window.location.href = "/signin";
+            return;
+        }
         if(data.error){
             alert("❌ Error exiting position: " + data.error);
         } else {
@@ -1187,6 +1410,11 @@ TEMPLATE = """
     async function checkBotStatus(){
         let res = await fetch("/bot_status");
         let data = await res.json();
+        if(data.error && data.error.includes("Session expired")) {
+            alert("Session expired! Redirecting to login...");
+            window.location.href = "/signin";
+            return;
+        }
         let statusDiv = document.getElementById("botStatus");
         if(data.running){
             statusDiv.innerHTML = '<span class="bot-status status-running">🤖 Bot Running (Background)</span>';
@@ -1202,6 +1430,11 @@ TEMPLATE = """
     async function fetchPositions(){
         let res = await fetch("/positions");
         let data = await res.json();
+        if(data.error && data.error.includes("Session expired")) {
+            alert("Session expired! Redirecting to login...");
+            window.location.href = "/signin";
+            return;
+        }
         let positionsDiv = document.getElementById("positionsTable");
         
         if(data.error){
@@ -1243,6 +1476,11 @@ TEMPLATE = """
     async function fetchChain(){
         let res = await fetch("/fetch");
         let data = await res.json();
+        if(data.error && data.error.includes("Session expired")) {
+            alert("Session expired! Redirecting to login...");
+            window.location.href = "/signin";
+            return;
+        }
         let tbl = document.getElementById("chain");
         tbl.innerHTML = "";
         let signalsDiv = document.getElementById("signals");
@@ -1409,9 +1647,24 @@ TEMPLATE = """
         });
     }
 
+    // Check session status periodically
+    async function checkSessionStatus(){
+        try {
+            let res = await fetch("/bot_status");
+            let data = await res.json();
+            if(data.error && data.error.includes("Session expired")) {
+                alert("Your session has expired! Redirecting to login...");
+                window.location.href = "/signin";
+            }
+        } catch(e) {
+            // Ignore errors, just continue
+        }
+    }
+
     setInterval(fetchChain, 2000);
     setInterval(fetchPositions, 3000);
     setInterval(checkBotStatus, 3000);
+    setInterval(checkSessionStatus, 30000); // Check session every 30 seconds
     window.onload = function(){
         fetchChain();
         fetchPositions();
@@ -1421,6 +1674,11 @@ TEMPLATE = """
     async function resetOrders(){
         let res = await fetch("/reset", {method: "POST"});
         let data = await res.json();
+        if(data.error && data.error.includes("Session expired")) {
+            alert("Session expired! Redirecting to login...");
+            window.location.href = "/signin";
+            return;
+        }
         alert(data.message);
         atmStrike = null;
         initialLTP = {};
@@ -1441,12 +1699,19 @@ TEMPLATE = """
     </div>
   </div>
 
+  {% if warning %}
+  <div class="session-warning">
+    ⚠️ {{ warning }}
+  </div>
+  {% endif %}
+
   <div class="bot-control">
     <div id="botStatus">
       <span class="bot-status status-stopped">⏸️ Bot Stopped</span>
     </div>
     <p style="margin: 10px 0; color: #666;">
-      ℹ️ Start background bot to run continuously even when browser is minimized/closed
+      ℹ️ Start background bot to run continuously even when browser is minimized/closed<br>
+      🔒 One session per user. New login will terminate this session.
     </p>
     <button id="startBtn" class="btn-start" onclick="startBackgroundBot()">▶️ Start Background Bot</button>
     <button id="stopBtn" class="btn-stop" onclick="stopBackgroundBot()" disabled>⏸️ Stop Bot</button>
@@ -1522,8 +1787,10 @@ if __name__ == "__main__":
     print("="*60)
     print(f"📍 Server: http://127.0.0.1:{port}")
     print("✅ Multi-user support with individual Fyers credentials!")
+    print("✅ ONE SESSION PER USER - New login terminates previous session!")
     print("✅ Each user has isolated trading environment!")
     print("✅ Background bot available per user!")
     print("✅ OI and Volume values displayed in crores!")
+    print("✅ Automatic session cleanup and expiration!")
     print("="*60 + "\n")
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
